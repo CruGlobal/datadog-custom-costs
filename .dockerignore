@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.vscode
+.dockerignore
+.gitignore
+.env
+.env.local
+*.json
+__pycache__
+*.pyc
+*.md
