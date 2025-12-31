@@ -24,7 +24,9 @@ This application fetches billing/usage data from cloud providers, converts it to
 ## Environment Variables
 
 ### Required
-- `GITHUB_TOKEN` - GitHub Personal Access Token with `billing:read` scope
+- `GITHUB_TOKEN` - GitHub Personal Access Token
+  - **Classic PAT**: Requires `admin:org` scope
+  - **Fine-grained PAT**: Requires "Administration" organization permissions (read)
 - `GITHUB_ORG` - GitHub organization name (e.g., "CruGlobal")
 - `DD_API_KEY` - Datadog API key
 - `DD_APP_KEY` - Datadog Application key
