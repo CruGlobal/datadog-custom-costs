@@ -14,6 +14,14 @@ This application fetches billing/usage data from cloud providers, converts it to
 - **Format**: FOCUS-compliant JSON with comprehensive tagging
 - **Schedule**: Daily at 06:00 UTC via ECS Fargate
 
+### Neon
+- **Data Source**: Neon Database Consumption API
+- **Metrics**: Compute (CU-hours), Storage (GB), Data Transfer
+- **Pricing**: Usage-based - $0.222/CU-hour, $0.35/GB-month
+- **Format**: FOCUS-compliant JSON with per-project cost allocation
+- **Tags**: project_id, project_name, service, env (parsed from project name)
+- **Schedule**: Daily at 06:30 UTC via ECS Fargate
+
 ## How It Works
 
 1. **Fetch**: Retrieves billing data from GitHub API for the current day
@@ -23,11 +31,20 @@ This application fetches billing/usage data from cloud providers, converts it to
 
 ## Environment Variables
 
-### Required
+### Job Selector (Required for Docker/ECS)
+- `JOB` - Specifies which integration to run: `GITHUB` or `NEON`
+
+### GitHub Integration
 - `GITHUB_TOKEN` - GitHub Personal Access Token
   - **Classic PAT**: Requires `admin:org` scope
   - **Fine-grained PAT**: Requires "Administration" organization permissions (read)
 - `GITHUB_ORG` - GitHub organization name (e.g., "CruGlobal")
+
+### Neon Integration
+- `NEON_API_KEY` - Neon API key with billing/consumption read access
+- `NEON_ORG_ID` - Neon organization ID
+
+### Datadog (Required for both)
 - `DD_API_KEY` - Datadog API key
 - `DD_APP_KEY` - Datadog Application key
 
@@ -44,19 +61,25 @@ pip install -r requirements.txt
 
 # Create .env file with credentials
 cat > .env << EOF
+# GitHub Integration
 GITHUB_TOKEN=ghp_your_token_here
 GITHUB_ORG=CruGlobal
+
+# Neon Integration
+NEON_API_KEY=your_neon_api_key
+NEON_ORG_ID=org-your-org-id
+
+# Datadog (shared)
 DD_API_KEY=your_datadog_api_key
 DD_APP_KEY=your_datadog_app_key
 EOF
 ```
 
 ### Run Locally
-```bash
-# Install python-dotenv for .env support
-pip install python-dotenv
 
-# Run for today's data
+#### GitHub Costs
+```bash
+# Run for yesterday's data (default)
 python github_costs.py
 
 # Run for a specific date
@@ -66,26 +89,41 @@ python github_costs.py --date 2025-12-22
 python github_costs.py --year 2025 --month 12
 ```
 
+#### Neon Costs
+```bash
+# Dry run - test without uploading (recommended first)
+python neon_costs.py --date 2026-01-05 --dry-run
+
+# Run for yesterday's data (default)
+python neon_costs.py
+
+# Run for a specific date
+python neon_costs.py --date 2026-01-05
+```
+
 ### Test Docker Build
 ```bash
 # Build image
 docker build -t datadog-custom-costs .
 
-# Run container (with environment variables)
-docker run --env-file .env datadog-custom-costs
+# Run GitHub job
+docker run --env-file .env -e JOB=GITHUB datadog-custom-costs
+
+# Run Neon job
+docker run --env-file .env -e JOB=NEON datadog-custom-costs
 ```
 
 ## Deployment
 
-This application runs as an ECS Fargate scheduled task managed by Terraform in the [cru-terraform](https://github.com/CruGlobal/cru-terraform) repository.
+This application runs as ECS Fargate scheduled tasks managed by Terraform in the [cru-terraform](https://github.com/CruGlobal/cru-terraform) repository.
 
 **Infrastructure**: `cru-terraform/applications/datadog-custom-costs/`
 
-
 ## Data Format
 
-Uploads follow the [Datadog Custom Costs schema](https://docs.datadoghq.com/cloud_cost_management/custom/):
+Uploads follow the [Datadog Custom Costs schema](https://docs.datadoghq.com/cloud_cost_management/custom/) (FOCUS-compliant).
 
+### GitHub Example
 ```json
 {
   "ProviderName": "GitHub",
@@ -99,6 +137,28 @@ Uploads follow the [Datadog Custom Costs schema](https://docs.datadoghq.com/clou
     "repository": "my-repo",
     "unit_type": "minute",
     "quantity": "1000"
+  }
+}
+```
+
+### Neon Example
+```json
+{
+  "ProviderName": "Neon",
+  "ChargeDescription": "Compute",
+  "ChargePeriodStart": "2026-01-05",
+  "ChargePeriodEnd": "2026-01-05",
+  "BilledCost": 2.45,
+  "BillingCurrency": "USD",
+  "Tags": {
+    "project_id": "calm-boat-12345678",
+    "project_name": "game-ops-prod",
+    "service": "game-ops",
+    "env": "prod",
+    "charge_type": "compute",
+    "compute_hours": "11.0432",
+    "rate_per_cu_hour": "0.222",
+    "active_seconds": "39755"
   }
 }
 ```

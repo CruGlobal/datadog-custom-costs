@@ -13,8 +13,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Make entrypoint script executable
+RUN chmod +x entrypoint.sh
+
 # Run as non-root user for security
 RUN adduser -D -u 1000 appuser && chown -R appuser:appuser /usr/src/app
 USER appuser
 
-CMD [ "python", "github_costs.py" ]
+ENTRYPOINT ["./entrypoint.sh"]
