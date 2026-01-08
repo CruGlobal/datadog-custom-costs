@@ -9,6 +9,7 @@ for upload to Datadog Cloud Cost Management.
 import os
 import sys
 import argparse
+import json
 from datetime import datetime, timedelta
 from decimal import Decimal
 import requests
@@ -166,6 +167,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
+  # Dry run - fetch and calculate costs without uploading (recommended for testing)
+  python github_costs.py --date 2025-12-22 --dry-run
+
   # Fetch yesterday's data (default - captures complete 24-hour period)
   python github_costs.py
 
@@ -181,13 +185,18 @@ Examples:
     parser.add_argument('--year', type=int, help='Year to fetch')
     parser.add_argument('--month', type=int, help='Month to fetch (1-12)')
     parser.add_argument('--day', type=int, help='Day to fetch (1-31)')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Fetch and calculate costs without uploading to Datadog')
 
     args = parser.parse_args()
 
     try:
-        # Initialize fetcher and uploader
+        # Initialize fetcher
         fetcher = GitHubCostFetcher()
-        uploader = DatadogCostUploader()
+
+        # Initialize uploader (only needed for non-dry-run)
+        if not args.dry_run:
+            uploader = DatadogCostUploader()
 
         # Determine date to fetch
         if args.date:
@@ -231,6 +240,22 @@ Examples:
         ]
 
         logger.info(f"Converted {len(focus_data)} GitHub usage items to FOCUS format")
+
+        # Handle dry-run mode
+        if args.dry_run:
+            logger.info("DRY RUN MODE - Not uploading to Datadog")
+            print("\n" + "="*80)
+            print("FOCUS COST RECORDS (would be uploaded to Datadog):")
+            print("="*80)
+            print(json.dumps(focus_data, indent=2))
+            print("="*80)
+
+            total_cost = sum(record["BilledCost"] for record in focus_data)
+            print(f"\nTotal cost: ${total_cost:.4f}")
+            print(f"FOCUS records generated: {len(focus_data)}")
+            print(f"Usage items processed: {len(usage_data)}")
+            logger.info("Dry run completed successfully")
+            sys.exit(0)
 
         # Upload to Datadog
         success = uploader.upload_costs(focus_data, provider_name="GitHub")
