@@ -103,7 +103,7 @@ class NeonCostFetcher:
             if projects:
                 # Log a sample to see the structure
                 sample = projects[0]
-                logger.info(f"Sample project structure: id={sample.get('id')}, name={sample.get('name')}")
+                logger.debug(f"Sample project structure: id={sample.get('id')}, name={sample.get('name')}")
             return project_map
 
         except requests.exceptions.HTTPError as e:
@@ -359,7 +359,7 @@ Examples:
         project_name_map = fetcher.fetch_project_metadata()
         logger.info(f"Project name map contains {len(project_name_map)} entries")
         if project_name_map:
-            logger.info(f"Sample project names: {list(project_name_map.items())[:3]}")
+            logger.debug(f"Sample project names: {list(project_name_map.items())[:3]}")
 
         # Fetch all projects with consumption data (single API call)
         projects = fetcher.fetch_projects_with_consumption(target_date)
@@ -388,25 +388,23 @@ Examples:
             }
 
             project_name = project_info["name"]
-            logger.info(f"Processing project: {project_name} ({project_id})")
+            logger.debug(f"Processing project: {project_name} ({project_id})")
 
             # Extract periods and consumption data
             periods = project.get("periods", [])
             if not periods:
-                # logger.info(f"  No consumption periods for project {project_id}")
                 continue
 
             # Get consumption from first period (should be single daily record)
             consumption = periods[0].get("consumption", [])
             if not consumption:
-                # logger.info(f"  No consumption data for project {project_id}")
                 continue
 
             projects_with_data += 1
 
             # Process the daily record (should be just one record for the day)
             if len(consumption) > 1:
-                logger.warning(f"  Expected 1 daily record but got {len(consumption)}, using first")
+                logger.warning(f"Expected 1 daily record but got {len(consumption)} for project {project_name}, using first")
 
             daily_record = consumption[0]
 
@@ -420,9 +418,8 @@ Examples:
             project_cost = Decimal(str(costs["compute_cost"])) + Decimal(str(costs["storage_cost"]))
             total_org_cost += project_cost
 
-            # Log project metrics
-            logger.info(f"  Compute: {costs['compute_hours']:.2f} hours, Storage: {costs['storage_gb']:.2f} GB")
-            logger.info(f"  Project cost: ${float(project_cost):.4f}")
+            # Log project metrics at debug level
+            logger.debug(f"  {project_name}: Compute={costs['compute_hours']:.2f}h, Storage={costs['storage_gb']:.2f}GB, Cost=${float(project_cost):.4f}")
 
             # Convert to FOCUS format (generates 1-2 records per project)
             focus_records = fetcher.convert_to_focus(costs, metrics, target_date, project_info)
