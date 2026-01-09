@@ -9,6 +9,7 @@ for upload to Datadog Cloud Cost Management.
 import os
 import sys
 import argparse
+import json
 from datetime import datetime, timedelta
 from decimal import Decimal
 import requests
@@ -102,6 +103,44 @@ class GitHubCostFetcher:
             logger.error(f"Request failed: {e}")
             raise
 
+    def get_repository_metadata(self, repository_name: str) -> Dict:
+        """
+        Fetch repository metadata including topics.
+
+        Args:
+            repository_name: Name of the repository
+
+        Returns:
+            Repository metadata dict with topics
+        """
+        url = f"{self.base_url}/repos/{self.org}/{repository_name}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            topics = data.get("topics", [])
+
+            # Log service topic detection
+            service_topics = [t for t in topics if t.startswith("service-")]
+            if service_topics:
+                logger.info(f"Repository '{repository_name}' has service topic: {service_topics[0]}")
+            else:
+                logger.debug(f"Repository '{repository_name}' has no service topic, using repo name")
+
+            return data
+        except requests.exceptions.HTTPError as e:
+            logger.warning(f"Failed to fetch metadata for '{repository_name}': HTTP {e.response.status_code}")
+            return {}
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to fetch metadata for '{repository_name}': {e}")
+            return {}
+
     def convert_to_focus(self, usage_item: Dict, billing_start: datetime, billing_end: datetime) -> Dict:
         """
         Convert GitHub usage item to Datadog Custom Costs (FOCUS) format.
@@ -147,6 +186,23 @@ class GitHubCostFetcher:
 
         if repository:
             tags["repository"] = repository
+
+            # Try to determine service:
+            # 1. Check for service-* topic (override)
+            # 2. Default to repository name
+            service = repository  # Default
+
+            # Fetch repo metadata to check for service topic
+            # GitHub topics use format: service-<name> (lowercase, hyphens only)
+            repo_metadata = self.get_repository_metadata(repository)
+            topics = repo_metadata.get("topics", [])
+
+            for topic in topics:
+                if topic.startswith("service-"):
+                    service = topic[8:]  # Remove "service-" prefix
+                    break
+
+            tags["service"] = service
         if unit_type:
             tags["unit_type"] = unit_type
         if quantity:
@@ -166,6 +222,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
+  # Dry run - fetch and calculate costs without uploading (recommended for testing)
+  python github_costs.py --date 2025-12-22 --dry-run
+
   # Fetch yesterday's data (default - captures complete 24-hour period)
   python github_costs.py
 
@@ -181,13 +240,18 @@ Examples:
     parser.add_argument('--year', type=int, help='Year to fetch')
     parser.add_argument('--month', type=int, help='Month to fetch (1-12)')
     parser.add_argument('--day', type=int, help='Day to fetch (1-31)')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Fetch and calculate costs without uploading to Datadog')
 
     args = parser.parse_args()
 
     try:
-        # Initialize fetcher and uploader
+        # Initialize fetcher
         fetcher = GitHubCostFetcher()
-        uploader = DatadogCostUploader()
+
+        # Initialize uploader (only needed for non-dry-run)
+        if not args.dry_run:
+            uploader = DatadogCostUploader()
 
         # Determine date to fetch
         if args.date:
@@ -231,6 +295,22 @@ Examples:
         ]
 
         logger.info(f"Converted {len(focus_data)} GitHub usage items to FOCUS format")
+
+        # Handle dry-run mode
+        if args.dry_run:
+            logger.info("DRY RUN MODE - Not uploading to Datadog")
+            print("\n" + "="*80)
+            print("FOCUS COST RECORDS (would be uploaded to Datadog):")
+            print("="*80)
+            print(json.dumps(focus_data, indent=2))
+            print("="*80)
+
+            total_cost = sum(record["BilledCost"] for record in focus_data)
+            print(f"\nTotal cost: ${total_cost:.4f}")
+            print(f"FOCUS records generated: {len(focus_data)}")
+            print(f"Usage items processed: {len(usage_data)}")
+            logger.info("Dry run completed successfully")
+            sys.exit(0)
 
         # Upload to Datadog
         success = uploader.upload_costs(focus_data, provider_name="GitHub")
