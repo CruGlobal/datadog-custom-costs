@@ -103,6 +103,44 @@ class GitHubCostFetcher:
             logger.error(f"Request failed: {e}")
             raise
 
+    def get_repository_metadata(self, repository_name: str) -> Dict:
+        """
+        Fetch repository metadata including topics.
+
+        Args:
+            repository_name: Name of the repository
+
+        Returns:
+            Repository metadata dict with topics
+        """
+        url = f"{self.base_url}/repos/{self.org}/{repository_name}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.token}",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            topics = data.get("topics", [])
+
+            # Log service topic detection
+            service_topics = [t for t in topics if t.startswith("service-")]
+            if service_topics:
+                logger.info(f"Repository '{repository_name}' has service topic: {service_topics[0]}")
+            else:
+                logger.debug(f"Repository '{repository_name}' has no service topic, using repo name")
+
+            return data
+        except requests.exceptions.HTTPError as e:
+            logger.warning(f"Failed to fetch metadata for '{repository_name}': HTTP {e.response.status_code}")
+            return {}
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to fetch metadata for '{repository_name}': {e}")
+            return {}
+
     def convert_to_focus(self, usage_item: Dict, billing_start: datetime, billing_end: datetime) -> Dict:
         """
         Convert GitHub usage item to Datadog Custom Costs (FOCUS) format.
@@ -148,6 +186,23 @@ class GitHubCostFetcher:
 
         if repository:
             tags["repository"] = repository
+
+            # Try to determine service:
+            # 1. Check for service-* topic (override)
+            # 2. Default to repository name
+            service = repository  # Default
+
+            # Fetch repo metadata to check for service topic
+            # GitHub topics use format: service-<name> (lowercase, hyphens only)
+            repo_metadata = self.get_repository_metadata(repository)
+            topics = repo_metadata.get("topics", [])
+
+            for topic in topics:
+                if topic.startswith("service-"):
+                    service = topic[8:]  # Remove "service-" prefix
+                    break
+
+            tags["service"] = service
         if unit_type:
             tags["unit_type"] = unit_type
         if quantity:

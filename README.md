@@ -12,6 +12,7 @@ This application fetches billing/usage data from cloud providers, converts it to
 - **Data Source**: GitHub Organization Billing API
 - **Metrics**: Actions, Packages, Storage, Codespaces, Copilot, etc.
 - **Format**: FOCUS-compliant JSON with comprehensive tagging
+- **Service Tagging**: Supports `service-*` GitHub topics for cost grouping
 - **Schedule**: Daily at 06:00 UTC via ECS Fargate
 
 ### Neon
@@ -36,8 +37,8 @@ This application fetches billing/usage data from cloud providers, converts it to
 
 ### GitHub Integration
 - `GITHUB_TOKEN` - GitHub Personal Access Token
-  - **Classic PAT**: Requires `admin:org` scope
-  - **Fine-grained PAT**: Requires "Administration" organization permissions (read)
+  - **Classic PAT**: Requires `admin:org` (for billing) and `repo` (for private repo metadata/topics) scopes
+  - **Fine-grained PAT**: Requires "Administration" organization permissions (read) and "Repository" permissions (read)
 - `GITHUB_ORG` - GitHub organization name (e.g., "CruGlobal")
 
 ### Neon Integration
@@ -79,6 +80,9 @@ EOF
 
 #### GitHub Costs
 ```bash
+# Dry run - test without uploading (recommended first)
+python github_costs.py --date 2025-12-22 --dry-run
+
 # Run for yesterday's data (default)
 python github_costs.py
 
@@ -135,11 +139,35 @@ Uploads follow the [Datadog Custom Costs schema](https://docs.datadoghq.com/clou
   "Tags": {
     "sku": "actions-linux",
     "repository": "my-repo",
+    "service": "my-service",
     "unit_type": "minute",
     "quantity": "1000"
   }
 }
 ```
+
+#### Service Tagging
+
+GitHub costs support service-level cost attribution using repository topics:
+
+1. **Add a `service-*` topic** to your repository (e.g., `service-terraform`, `service-godtools`)
+2. **Cost attribution**: All costs for that repo will be tagged with the extracted service name
+3. **Default behavior**: If no `service-*` topic exists, uses the repository name as the service
+
+**Topic Requirements** (GitHub restrictions):
+- Lowercase letters, numbers, and hyphens only
+- Maximum 50 characters
+- Maximum 20 topics per repository
+
+**Analyze your repositories** to find service grouping opportunities:
+```bash
+python analyze_repos.py
+```
+
+This script will:
+- Identify existing `service-*` topics
+- Recommend which repos should share service tags
+- Show potential cost groupings based on naming patterns
 
 ### Neon Example
 ```json
