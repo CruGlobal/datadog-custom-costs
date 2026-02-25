@@ -30,15 +30,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Neon Scale Plan Pricing (Feb 2026+)
-# Note: Scale plan includes 100GB/month free public egress at the org level.
-# We intentionally charge all transfer at $0.10/GB per project for visibility
-# into per-project usage patterns. This inflates totals by up to $10/month.
 PRICING = {
-    "compute_per_cu_hour": Decimal("0.222"),      # $0.222 per CU-hour
-    "storage_per_gb_month": Decimal("0.35"),      # $0.35 per GB-month
-    "data_transfer_per_gb": Decimal("0.10"),      # $0.10 per GB (public egress)
-    "branch_per_month": Decimal("1.50"),          # $1.50 per branch-month
-    "instant_restore_per_gb_month": Decimal("0.20"),  # $0.20 per GB-month
+    "compute_per_cu_hour": Decimal("0.222"),              # $0.222 per CU-hour
+    "storage_per_gb_month": Decimal("0.35"),              # $0.35 per GB-month
+    "data_transfer_per_gb": Decimal("0.10"),              # $0.10 per GB (public egress)
+    "data_transfer_free_gb_per_project": Decimal("100"),  # 100 GB free per project per month
+    "branch_per_month": Decimal("1.50"),                  # $1.50 per branch-month
+    "instant_restore_per_gb_month": Decimal("0.20"),      # $0.20 per GB-month
 }
 
 
@@ -115,20 +113,23 @@ class NeonCostFetcher:
             logger.warning(f"Request failed for project metadata: {e}")
             return {}
 
-    def fetch_projects_with_consumption(self, date: datetime) -> List[Dict]:
+    def fetch_projects_with_consumption(self, date: datetime, from_date: datetime = None) -> List[Dict]:
         """
-        Fetch all projects with their consumption data for a specific date.
+        Fetch all projects with their consumption data for a date range.
         Uses the bulk endpoint that returns all projects and consumption in one call.
 
         Args:
-            date: Date to fetch consumption data for
+            date: End date (inclusive) to fetch consumption data for
+            from_date: Start date for the range. Defaults to start of date's day
+                       (single-day fetch). Set to month start for cumulative queries.
 
         Returns:
             List of project dictionaries with embedded consumption data
         """
-        # Build date range (full 24-hour period in UTC)
-        # For daily granularity: from = start of day, to = start of next day
-        from_time = date.replace(hour=0, minute=0, second=0, microsecond=0)
+        if from_date:
+            from_time = from_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            from_time = date.replace(hour=0, minute=0, second=0, microsecond=0)
         to_time = (date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
         url = f"{self.base_url}/consumption_history/v2/projects"
@@ -217,34 +218,94 @@ class NeonCostFetcher:
             "public_transfer_bytes": metrics_lookup.get("public_network_transfer_bytes", 0),
         }
 
-    def calculate_daily_costs(self, metrics: Dict, date: datetime) -> Dict:
+    def calculate_monthly_transfer(self, projects: List[Dict], target_date: datetime) -> Dict[str, Dict]:
+        """
+        Calculate per-project month-to-date public network transfer.
+
+        Separates transfer into prior days (before target_date) and target day,
+        so we can determine how much of the target day's transfer is billable
+        after applying the 100GB/month free tier.
+
+        Args:
+            projects: List of project dicts from fetch_projects_with_consumption
+                      (fetched with month-to-date range)
+            target_date: The day we're calculating costs for
+
+        Returns:
+            Dict mapping project_id to {prior_cumulative_bytes, target_day_bytes}
+        """
+        target_day_str = target_date.strftime("%Y-%m-%d")
+        result = {}
+
+        for project in projects:
+            project_id = project.get("project_id")
+            prior_bytes = 0
+            target_bytes = 0
+
+            for period in project.get("periods", []):
+                for record in period.get("consumption", []):
+                    # Extract transfer bytes from this daily record
+                    transfer_bytes = 0
+                    for m in record.get("metrics", []):
+                        if m.get("metric_name") == "public_network_transfer_bytes":
+                            transfer_bytes = m.get("value", 0)
+                            break
+
+                    # Check if this record is for the target day
+                    timeframe_start = record.get("timeframe_start", "")
+                    if timeframe_start.startswith(target_day_str):
+                        target_bytes += transfer_bytes
+                    else:
+                        prior_bytes += transfer_bytes
+
+            result[project_id] = {
+                "prior_cumulative_bytes": prior_bytes,
+                "target_day_bytes": target_bytes,
+            }
+
+        return result
+
+    def calculate_daily_costs(self, metrics: Dict, date: datetime, prior_transfer_bytes: int = 0) -> Dict:
         """
         Calculate costs from daily metrics using Neon's usage-based pricing.
 
         Args:
             metrics: Daily metrics (from extract_daily_metrics)
             date: Date for the calculation (used to determine days in month for storage proration)
+            prior_transfer_bytes: Cumulative public transfer for this project earlier
+                                  in the month (before target day), used for free tier calc
 
         Returns:
             Dictionary with calculated daily costs and details
         """
         days_in_month = calendar.monthrange(date.year, date.month)[1]
+        gb = Decimal("1073741824")
+        free_tier_gb = PRICING["data_transfer_free_gb_per_project"]
 
         # 1. Compute cost - $0.222 per CU-hour
         compute_hours = Decimal(str(metrics["compute_seconds"])) / Decimal("3600")
         compute_cost = compute_hours * PRICING["compute_per_cu_hour"]
 
         # 2. Storage cost - $0.35 per GB-month, prorated daily
-        # storage_bytes is the average for the day
-        storage_gb = Decimal(str(metrics["storage_bytes"])) / Decimal("1073741824")
-        # Convert to daily cost: (GB * $0.35/GB-month) / days_in_month
+        storage_gb = Decimal(str(metrics["storage_bytes"])) / gb
         storage_cost = (storage_gb * PRICING["storage_per_gb_month"]) / Decimal(str(days_in_month))
 
-        # 3. Data transfer (public egress) - $0.10/GB
-        # Charged on all usage without deducting org-level 100GB/month free tier,
-        # so per-project costs reflect actual transfer patterns throughout the month.
-        public_transfer_gb = Decimal(str(metrics["public_transfer_bytes"])) / Decimal("1073741824")
-        data_transfer_cost = public_transfer_gb * PRICING["data_transfer_per_gb"]
+        # 3. Data transfer (public egress) - $0.10/GB after 100GB free per project per month
+        public_transfer_gb = Decimal(str(metrics["public_transfer_bytes"])) / gb
+        prior_gb = Decimal(str(prior_transfer_bytes)) / gb
+        total_cumulative_gb = prior_gb + public_transfer_gb
+
+        if total_cumulative_gb <= free_tier_gb:
+            # Still within free tier
+            billable_transfer_gb = Decimal("0")
+        elif prior_gb >= free_tier_gb:
+            # Already exceeded free tier before today - all of today is billable
+            billable_transfer_gb = public_transfer_gb
+        else:
+            # Crossed the threshold today - only the overage is billable
+            billable_transfer_gb = total_cumulative_gb - free_tier_gb
+
+        data_transfer_cost = billable_transfer_gb * PRICING["data_transfer_per_gb"]
 
         return {
             "compute_cost": float(compute_cost),
@@ -253,6 +314,8 @@ class NeonCostFetcher:
             "compute_hours": float(compute_hours),
             "storage_gb": float(storage_gb),
             "public_transfer_gb": float(public_transfer_gb),
+            "billable_transfer_gb": float(billable_transfer_gb),
+            "monthly_cumulative_transfer_gb": float(total_cumulative_gb),
             "compute_rate": float(PRICING["compute_per_cu_hour"]),
             "storage_rate": float(PRICING["storage_per_gb_month"]),
             "data_transfer_rate": float(PRICING["data_transfer_per_gb"]),
@@ -342,6 +405,8 @@ class NeonCostFetcher:
                     **project_tags,
                     "charge_type": "data_transfer",
                     "public_transfer_gb": f"{costs['public_transfer_gb']:.4f}",
+                    "billable_transfer_gb": f"{costs['billable_transfer_gb']:.4f}",
+                    "monthly_cumulative_gb": f"{costs['monthly_cumulative_transfer_gb']:.2f}",
                     "rate_per_gb": str(costs["data_transfer_rate"]),
                 }
             })
@@ -395,12 +460,16 @@ Examples:
         if project_name_map:
             logger.debug(f"Sample project names: {list(project_name_map.items())[:3]}")
 
-        # Fetch all projects with consumption data (single API call)
-        projects = fetcher.fetch_projects_with_consumption(target_date)
+        # Fetch month-to-date consumption data (for cumulative transfer calculation)
+        month_start = target_date.replace(day=1)
+        projects = fetcher.fetch_projects_with_consumption(target_date, from_date=month_start)
 
         if not projects:
             logger.warning("No projects found in organization")
             sys.exit(0)
+
+        # Calculate per-project month-to-date transfer for free tier logic
+        transfer_map = fetcher.calculate_monthly_transfer(projects, target_date)
 
         # Process each project
         all_focus_records = []
@@ -424,38 +493,39 @@ Examples:
             project_name = project_info["name"]
             logger.debug(f"Processing project: {project_name} ({project_id})")
 
-            # Extract periods and consumption data
-            periods = project.get("periods", [])
-            if not periods:
-                continue
+            # Find the target day's consumption record from the month-to-date data
+            target_day_str = target_date.strftime("%Y-%m-%d")
+            daily_record = None
+            for period in project.get("periods", []):
+                for record in period.get("consumption", []):
+                    if record.get("timeframe_start", "").startswith(target_day_str):
+                        daily_record = record
+                        break
+                if daily_record:
+                    break
 
-            # Get consumption from first period (should be single daily record)
-            consumption = periods[0].get("consumption", [])
-            if not consumption:
+            if not daily_record:
                 continue
 
             projects_with_data += 1
 
-            # Process the daily record (should be just one record for the day)
-            if len(consumption) > 1:
-                logger.warning(f"Expected 1 daily record but got {len(consumption)} for project {project_name}, using first")
-
-            daily_record = consumption[0]
-
-            # Extract metrics for the day
+            # Extract metrics for the target day
             metrics = fetcher.extract_daily_metrics(daily_record)
 
+            # Get prior cumulative transfer for free tier calculation
+            prior_transfer = transfer_map.get(project_id, {}).get("prior_cumulative_bytes", 0)
+
             # Calculate costs for the day
-            costs = fetcher.calculate_daily_costs(metrics, target_date)
+            costs = fetcher.calculate_daily_costs(metrics, target_date, prior_transfer_bytes=prior_transfer)
 
             # Track project total
             project_cost = Decimal(str(costs["compute_cost"])) + Decimal(str(costs["storage_cost"])) + Decimal(str(costs["data_transfer_cost"]))
             total_org_cost += project_cost
 
             # Log project metrics at debug level
-            logger.debug(f"  {project_name}: Compute={costs['compute_hours']:.2f}h, Storage={costs['storage_gb']:.2f}GB, Transfer={costs['public_transfer_gb']:.2f}GB, Cost=${float(project_cost):.4f}")
+            logger.debug(f"  {project_name}: Compute={costs['compute_hours']:.2f}h, Storage={costs['storage_gb']:.2f}GB, Transfer={costs['public_transfer_gb']:.2f}GB (cumulative={costs['monthly_cumulative_transfer_gb']:.2f}GB), Cost=${float(project_cost):.4f}")
 
-            # Convert to FOCUS format (generates 1-2 records per project)
+            # Convert to FOCUS format (generates 1-3 records per project)
             focus_records = fetcher.convert_to_focus(costs, metrics, target_date, project_info)
             all_focus_records.extend(focus_records)
 
