@@ -2,11 +2,11 @@
 """
 Neon Database Cost Data Generator
 
-Fetches daily consumption data from Neon API and converts it to FOCUS format
-for upload to Datadog Cloud Cost Management.
+Fetches daily consumption data from Neon's v2 consumption history API and
+converts it to FOCUS format for upload to Datadog Cloud Cost Management.
 
-Supports Neon's new Scale plan (Feb 2026+) with 100% usage-based pricing.
-Tracks costs per-project for cost allocation and chargeback.
+Supports Neon's Scale plan (Feb 2026+) with usage-based pricing.
+Tracks compute, storage, and data transfer costs per-project.
 """
 
 import os
@@ -30,11 +30,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Neon Scale Plan Pricing (Feb 2026+)
+# Note: Scale plan includes 100GB/month free public egress at the org level.
+# We intentionally charge all transfer at $0.10/GB per project for visibility
+# into per-project usage patterns. This inflates totals by up to $10/month.
 PRICING = {
     "compute_per_cu_hour": Decimal("0.222"),      # $0.222 per CU-hour
     "storage_per_gb_month": Decimal("0.35"),      # $0.35 per GB-month
-    "data_transfer_per_gb": Decimal("0.10"),      # $0.10 per GB (after 100GB free)
-    "data_transfer_free_gb": Decimal("100"),      # 100 GB free per month
+    "data_transfer_per_gb": Decimal("0.10"),      # $0.10 per GB (public egress)
     "branch_per_month": Decimal("1.50"),          # $1.50 per branch-month
     "instant_restore_per_gb_month": Decimal("0.20"),  # $0.20 per GB-month
 }
@@ -129,7 +131,7 @@ class NeonCostFetcher:
         from_time = date.replace(hour=0, minute=0, second=0, microsecond=0)
         to_time = (date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
-        url = f"{self.base_url}/consumption_history/projects"
+        url = f"{self.base_url}/consumption_history/v2/projects"
         headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self.api_key}"
@@ -146,7 +148,8 @@ class NeonCostFetcher:
                 "from": from_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "to": to_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "granularity": "daily",
-                "org_id": self.org_id
+                "org_id": self.org_id,
+                "metrics": "compute_unit_seconds,root_branch_bytes_month,child_branch_bytes_month,public_network_transfer_bytes"
             }
 
             if cursor:
@@ -185,21 +188,33 @@ class NeonCostFetcher:
 
     def extract_daily_metrics(self, daily_record: Dict) -> Dict:
         """
-        Extract metrics from a single daily consumption record.
+        Extract metrics from a single daily consumption record (v2 format).
+
+        The v2 API returns metrics as an array of {metric_name, value} objects
+        instead of flat fields.
 
         Args:
-            daily_record: Single daily consumption record from API
+            daily_record: Single daily consumption record from v2 API
 
         Returns:
             Dictionary with daily metrics
         """
+        # Build lookup from the v2 metrics array
+        metrics_lookup = {}
+        for m in daily_record.get("metrics", []):
+            metrics_lookup[m.get("metric_name")] = m.get("value", 0)
+
         return {
             "timeframe_start": daily_record.get("timeframe_start", ""),
             "timeframe_end": daily_record.get("timeframe_end", ""),
-            "compute_seconds": daily_record.get("compute_time_seconds", 0),
-            "active_seconds": daily_record.get("active_time_seconds", 0),
-            "written_bytes": daily_record.get("written_data_bytes", 0),
-            "storage_bytes": daily_record.get("synthetic_storage_size_bytes", 0)
+            "compute_seconds": metrics_lookup.get("compute_unit_seconds", 0),
+            "storage_bytes": (
+                metrics_lookup.get("root_branch_bytes_month", 0)
+                + metrics_lookup.get("child_branch_bytes_month", 0)
+            ),
+            "root_branch_bytes": metrics_lookup.get("root_branch_bytes_month", 0),
+            "child_branch_bytes": metrics_lookup.get("child_branch_bytes_month", 0),
+            "public_transfer_bytes": metrics_lookup.get("public_network_transfer_bytes", 0),
         }
 
     def calculate_daily_costs(self, metrics: Dict, date: datetime) -> Dict:
@@ -225,9 +240,11 @@ class NeonCostFetcher:
         # Convert to daily cost: (GB * $0.35/GB-month) / days_in_month
         storage_cost = (storage_gb * PRICING["storage_per_gb_month"]) / Decimal(str(days_in_month))
 
-        # 3. Data transfer (egress) - $0.10/GB after 100GB/month
-        # Note: Current API doesn't provide egress data separately
-        data_transfer_cost = Decimal("0")
+        # 3. Data transfer (public egress) - $0.10/GB
+        # Charged on all usage without deducting org-level 100GB/month free tier,
+        # so per-project costs reflect actual transfer patterns throughout the month.
+        public_transfer_gb = Decimal(str(metrics["public_transfer_bytes"])) / Decimal("1073741824")
+        data_transfer_cost = public_transfer_gb * PRICING["data_transfer_per_gb"]
 
         return {
             "compute_cost": float(compute_cost),
@@ -235,8 +252,10 @@ class NeonCostFetcher:
             "data_transfer_cost": float(data_transfer_cost),
             "compute_hours": float(compute_hours),
             "storage_gb": float(storage_gb),
+            "public_transfer_gb": float(public_transfer_gb),
             "compute_rate": float(PRICING["compute_per_cu_hour"]),
             "storage_rate": float(PRICING["storage_per_gb_month"]),
+            "data_transfer_rate": float(PRICING["data_transfer_per_gb"]),
             "days_in_month": days_in_month
         }
 
@@ -290,7 +309,6 @@ class NeonCostFetcher:
                     "charge_type": "compute",
                     "compute_hours": f"{costs['compute_hours']:.4f}",
                     "rate_per_cu_hour": str(costs["compute_rate"]),
-                    "active_seconds": str(metrics["active_seconds"])
                 }
             })
 
@@ -308,7 +326,23 @@ class NeonCostFetcher:
                     "charge_type": "storage",
                     "storage_gb": f"{costs['storage_gb']:.2f}",
                     "rate_per_gb_month": str(costs["storage_rate"]),
-                    "written_bytes": str(metrics["written_bytes"])
+                }
+            })
+
+        # Record 3: Data transfer cost (only if > 0)
+        if costs["data_transfer_cost"] > 0:
+            focus_records.append({
+                "ProviderName": "Neon",
+                "ChargeDescription": "Data Transfer",
+                "ChargePeriodStart": charge_date,
+                "ChargePeriodEnd": charge_date,
+                "BilledCost": costs["data_transfer_cost"],
+                "BillingCurrency": "USD",
+                "Tags": {
+                    **project_tags,
+                    "charge_type": "data_transfer",
+                    "public_transfer_gb": f"{costs['public_transfer_gb']:.4f}",
+                    "rate_per_gb": str(costs["data_transfer_rate"]),
                 }
             })
 
@@ -415,11 +449,11 @@ Examples:
             costs = fetcher.calculate_daily_costs(metrics, target_date)
 
             # Track project total
-            project_cost = Decimal(str(costs["compute_cost"])) + Decimal(str(costs["storage_cost"]))
+            project_cost = Decimal(str(costs["compute_cost"])) + Decimal(str(costs["storage_cost"])) + Decimal(str(costs["data_transfer_cost"]))
             total_org_cost += project_cost
 
             # Log project metrics at debug level
-            logger.debug(f"  {project_name}: Compute={costs['compute_hours']:.2f}h, Storage={costs['storage_gb']:.2f}GB, Cost=${float(project_cost):.4f}")
+            logger.debug(f"  {project_name}: Compute={costs['compute_hours']:.2f}h, Storage={costs['storage_gb']:.2f}GB, Transfer={costs['public_transfer_gb']:.2f}GB, Cost=${float(project_cost):.4f}")
 
             # Convert to FOCUS format (generates 1-2 records per project)
             focus_records = fetcher.convert_to_focus(costs, metrics, target_date, project_info)
